@@ -1,4 +1,3 @@
-
 import os
 import subprocess
 import sys
@@ -248,8 +247,8 @@ class Command(BaseCommand):
         interval: Interval,
         files: List[str],
     ):
-        # Never delete backups before a successful upload.
-        # Only remove files exceeding the retention limit.
+        # Remove backups exceeding the retention limit,
+        # even when no new backup was created during this execution.
         files = sorted(files)
 
         while len(files) > interval.max_backups:
@@ -274,19 +273,18 @@ class Command(BaseCommand):
 
                 files = self.storage.list_directory(directory)
 
-                if not self.should_save_new_file(interval, files):
+                if self.should_save_new_file(interval, files):
+                    filename = f'{time.strftime(TIME_FORMAT)}.psql'
+                    object_key = f'{directory}/{filename}'
+
+                    self.create_backup(object_key)
+                    files.append(object_key)
+                else:
                     self.print_info(
                         f'Backup already exists for {interval.name}'
                     )
-                    continue
 
-                filename = f'{time.strftime(TIME_FORMAT)}.psql'
-                object_key = f'{directory}/{filename}'
-
-                self.create_backup(object_key)
-
-                files.append(object_key)
-
+                # Enforce retention even when no new backup is needed.
                 self.remove_oldest_files(interval, files)
 
             self.print_info('Backup Script Complete')

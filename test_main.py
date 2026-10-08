@@ -1,4 +1,3 @@
-
 import os
 import tempfile
 import unittest
@@ -175,9 +174,68 @@ class TestBackupJob(unittest.TestCase):
         # No new database dump or upload should occur.
         self.command.db.dump.assert_not_called()
         self.command.storage.write_file.assert_not_called()
-        self.command.storage.delete_file.assert_not_called()
+        self.command.storage.delete_file.assert_called_once_with(
+            "prod/day/2026:10:01:00:00:00.psql"
+        )
 
+        self.assertNotIn(
+            "prod/day/2026:10:01:00:00:00.psql",
+            self.objects,
+        )
+
+        self.assertEqual(
+            len([
+                key for key in self.objects
+                if key.startswith("prod/day/")
+            ]),
+            7,
+        )
         self.assertFalse(self.dump_file.exists())
+
+    @patch.object(main.time, "strftime", return_value="2026:10:08:00:00:00")
+    def test_retention_runs_without_new_backup(self, mock_time):
+        from datetime import datetime as real_datetime
+
+        # Add a backup for the current day.
+        self.objects.add(
+            "prod/day/2026:10:08:00:00:00.psql"
+        )
+
+        class MockDatetime(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 10, 8, 12, 0, 0)
+
+        with patch.object(main, "datetime", MockDatetime):
+            self.command.job()
+
+        # The current day's backup already exists.
+        # No new database dump or upload should happen for daily backups.
+        self.assertNotIn(
+            "prod/day/2026:10:08:00:00:00.psql",
+            [
+                call.args[1]
+                for call in self.command.storage.write_file.call_args_list
+            ],
+        )
+
+        # Retention still removes the oldest daily backup.
+        self.command.storage.delete_file.assert_any_call(
+            "prod/day/2026:10:01:00:00:00.psql"
+        )
+
+        self.assertNotIn(
+            "prod/day/2026:10:01:00:00:00.psql",
+            self.objects,
+        )
+
+        self.assertEqual(
+            len([
+                key for key in self.objects
+                if key.startswith("prod/day/")
+            ]),
+            7,
+        )
 
 if __name__ == "__main__":
     unittest.main()
