@@ -1,9 +1,8 @@
 #!/usr/bin/env sh
+set -eu
 
-# export environment variables
+# Load environment variables from the mounted secret.
 . /envs/env-local.sh
 
-service postgresql start
-
-# run python logic
-python main.py
+# Run the backup script.
+exec python main.py

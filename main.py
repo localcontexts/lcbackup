@@ -1,25 +1,31 @@
+
 import os
 import subprocess
 import sys
 import time
 
-from typing import List
-from pathlib import Path
-from datetime import datetime, timedelta
 from collections import namedtuple
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import List
 
 import boto3
 
 
 TIME_FORMAT = '%Y:%m:%d:%H:%M:%S'
+
 Interval = namedtuple('Interval', ['name', 'max_backups'])
+
 INTERVALS = [
     Interval('day', 7),
     Interval('week', 5),
     Interval('month', 12),
     Interval('year', 4),
 ]
+
 CURRENT_FOLDER = Path(__file__).parent.absolute()
+DUMPED_FILES_FOLDER = CURRENT_FOLDER / 'dumped_files'
+DUMP_FILE = DUMPED_FILES_FOLDER / 'dumped.psql'
 
 DB_HOST = os.environ.get('DB_HOST')
 DB_NAME = os.environ.get('DB_NAME')
@@ -28,7 +34,7 @@ DB_USER = os.environ.get('DB_USER')
 DB_PASS = os.environ.get('DB_PASS')
 
 DEBUG = os.environ.get('DEBUG_VALUE')
-BOTO_SESSION = boto3.session.Session()
+
 ACCESS_KEY = os.environ.get('DBBACKUP_ACCESS_KEY')
 SECRET_KEY = os.environ.get('DBBACKUP_SECRET_KEY')
 BUCKET_NAME = os.environ.get('DBBACKUP_BUCKET_NAME')
@@ -37,50 +43,72 @@ ENDPOINT_URL = os.environ.get('DBBACKUP_ENDPOINT_URL')
 
 class Storage:
     def __init__(self, access_key, secret_key, bucket_name, endpoint_url):
+        if not all([access_key, secret_key, bucket_name, endpoint_url]):
+            raise RuntimeError('S3 bucket is not configured')
 
-        if not (access_key and secret_key and bucket_name and endpoint_url):
-            # raise error if any s3-related env is None
-            raise Exception('S3 Bucket Is Not Configured')
+        self.bucket_name = bucket_name
 
-        self.client = BOTO_SESSION.client(
+        self.client = boto3.session.Session().client(
             's3',
             region_name='nyc3',
             endpoint_url=endpoint_url,
             aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key
+            aws_secret_access_key=secret_key,
         )
-        self.bucket_name = bucket_name
 
-    def write_file(self, absolute_file_path: str, file_path_in_s3_bucket):
-        self.client.upload_file(absolute_file_path, self.bucket_name, file_path_in_s3_bucket)
+    def write_file(self, local_file_path: str, object_key: str):
+        self.client.upload_file(
+            local_file_path,
+            self.bucket_name,
+            object_key,
+        )
 
-    def delete_file(self, file_path_in_s3_bucket: str):
+        # Confirm the uploaded object exists and has content.
+        response = self.client.head_object(
+            Bucket=self.bucket_name,
+            Key=object_key,
+        )
+
+        if response['ContentLength'] <= 0:
+            raise RuntimeError(
+                f'Uploaded backup is empty: {object_key}'
+            )
+
+    def delete_file(self, object_key: str):
         self.client.delete_object(
             Bucket=self.bucket_name,
-            Key=file_path_in_s3_bucket,
+            Key=object_key,
         )
 
-    def list_directory(self, directory_path: str) -> list:
-        response = self.client.list_objects_v2(
+    def list_directory(self, directory_path: str) -> List[str]:
+        # S3 returns full object keys, not just filenames.
+        prefix = directory_path.rstrip('/') + '/'
+
+        paginator = self.client.get_paginator('list_objects_v2')
+
+        files = []
+
+        for page in paginator.paginate(
             Bucket=self.bucket_name,
-            Prefix=directory_path
-        )
+            Prefix=prefix,
+        ):
+            for item in page.get('Contents', []):
+                key = item['Key']
 
-        if response['KeyCount'] == 0:
-            return []
+                if key.endswith('.psql'):
+                    files.append(key)
 
-        # return file names
-        return [f['Key'] for f in response['Contents']]
+        return sorted(files)
 
 
 class BaseCommand:
     @staticmethod
     def print_error(message: str):
-        print(message, file=sys.stderr)
+        print(message, file=sys.stderr, flush=True)
 
     @staticmethod
     def print_info(message: str):
-        print(message, file=sys.stdout)
+        print(message, file=sys.stdout, flush=True)
 
 
 class DB_CONNECTOR:
@@ -93,129 +121,192 @@ class DB_CONNECTOR:
             'PASSWORD': password,
         }
 
+        if not all(self.settings.values()):
+            raise RuntimeError('Database connection is not configured')
+
     def dump(self, output_file_path):
-        cmd = f'PGPASSWORD="{DB_PASS}" runuser -u {DB_USER} -- pg_dump -U {DB_USER} -h {DB_HOST} {DB_NAME} > {output_file_path}'
+        env = os.environ.copy()
+        env['PGPASSWORD'] = self.settings['PASSWORD']
 
-        result = subprocess.run(
-            cmd, capture_output=True, shell=True, timeout=60,
-        )
+        cmd = [
+            'pg_dump',
+            '-U', self.settings['USER'],
+            '-h', self.settings['HOST'],
+            '-p', str(self.settings['PORT']),
+            '-d', self.settings['NAME'],
+            '-f', str(output_file_path),
+        ]
 
-        # forward error when cmd fails
-        if result.stderr:
-            error_message = f'Error Dumping File: {result.stderr}'
-            raise Exception(error_message)
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=300,
+                check=True,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                'Database dump exceeded the 300-second timeout'
+            ) from e
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f'Database dump failed: {e.stderr}'
+            ) from e
+
+        if not output_file_path.is_file():
+            raise RuntimeError('Database dump file was not created')
+
+        if output_file_path.stat().st_size == 0:
+            raise RuntimeError('Database dump file is empty')
 
 
 class Command(BaseCommand):
-    help = 'Runs backup code'
-    storage = Storage(ACCESS_KEY, SECRET_KEY, BUCKET_NAME, ENDPOINT_URL)
-    db = DB_CONNECTOR(DB_HOST, DB_NAME, DB_PORT, DB_USER, DB_PASS)
-    env = 'prod' if DEBUG == 'False' else 'dev'
+    def __init__(self):
+        self.storage = Storage(
+            ACCESS_KEY,
+            SECRET_KEY,
+            BUCKET_NAME,
+            ENDPOINT_URL,
+        )
+
+        self.db = DB_CONNECTOR(
+            DB_HOST,
+            DB_NAME,
+            DB_PORT,
+            DB_USER,
+            DB_PASS,
+        )
+
+        self.env = 'prod' if DEBUG == 'False' else 'dev'
 
     @staticmethod
     def truncate_datetime(dt: datetime, interval_name: str) -> datetime:
-        """
-        Rounds datetime precision down to the nearest year, month, week, or day.
-        """
-
         if interval_name == 'year':
-            return datetime(year=dt.year, month=1, day=1)
+            return datetime(dt.year, 1, 1)
 
-        elif interval_name == 'month':
-            return datetime(year=dt.year, month=dt.month, day=1)
+        if interval_name == 'month':
+            return datetime(dt.year, dt.month, 1)
 
-        elif interval_name == 'week':
-            # note start of week may be in previous month
-            days_after_start_of_week = dt.weekday()
-            return datetime(year=dt.year, month=dt.month, day=dt.day) - timedelta(days_after_start_of_week)
+        if interval_name == 'week':
+            return datetime(dt.year, dt.month, dt.day) - timedelta(
+                days=dt.weekday()
+            )
 
-        elif interval_name == 'day':
-            return datetime(year=dt.year, month=dt.month, day=dt.day)
+        if interval_name == 'day':
+            return datetime(dt.year, dt.month, dt.day)
 
-        else:
-            raise Exception('Invalid Interval Name')
+        raise ValueError(f'Invalid interval: {interval_name}')
 
     @staticmethod
-    def remove_dumped_file(dumped_file_path):
-        if os.path.exists(dumped_file_path):
-            os.remove(dumped_file_path)
+    def remove_dumped_file():
+        if DUMP_FILE.exists():
+            DUMP_FILE.unlink()
 
-    def create_backup(self, s3_file_path: str) -> bool:
-        # returns True when backup was created and False otherwise
-        dumped_db_file_path = os.path.join(CURRENT_FOLDER, 'dumped_files', 'dumped.psql')
+    def create_backup(self, object_key: str):
+        if not DUMP_FILE.is_file():
+            self.print_info('Creating database dump')
+            self.db.dump(DUMP_FILE)
 
-        try:
-            # create db dump only when file doesn't exist
-            if not os.path.isfile(dumped_db_file_path):
-                self.db.dump(dumped_db_file_path)
+        if DUMP_FILE.stat().st_size == 0:
+            raise RuntimeError('Database dump file is empty')
 
-            self.storage.write_file(dumped_db_file_path, s3_file_path)
+        self.print_info(f'Uploading backup: {object_key}')
+        self.storage.write_file(str(DUMP_FILE), object_key)
+
+        self.print_info(f'Backup uploaded successfully: {object_key}')
+
+    def should_save_new_file(
+        self,
+        interval: Interval,
+        files: List[str],
+    ) -> bool:
+        if not files:
             return True
-        except Exception as e:
-            # remove the dumped file since an error happened,
-            # the file is likely empty
-            self.remove_dumped_file(dumped_db_file_path)
-            self.print_error(f'Error Creating File {s3_file_path}: {e}')
-            return False
 
-    def should_save_new_file(self, interval: Interval, files: List[str]) -> bool:
-        if len(files) == 0:
-            return True
+        most_recent_file = Path(files[-1]).stem
+        most_recent_datetime = datetime.strptime(
+            most_recent_file,
+            TIME_FORMAT,
+        )
 
-        most_recent_file_name = Path(files[-1]).stem
-        most_recent_file_datetime = datetime.strptime(most_recent_file_name, TIME_FORMAT)
+        last_backup_period = self.truncate_datetime(
+            most_recent_datetime,
+            interval.name,
+        )
 
-        truncated_recent_file_time = self.truncate_datetime(most_recent_file_datetime, interval.name)
-        truncated_current_time = self.truncate_datetime(datetime.now(), interval.name)
+        current_period = self.truncate_datetime(
+            datetime.now(),
+            interval.name,
+        )
 
-        # compare the truncated times to see if they are the same
-        return truncated_recent_file_time != truncated_current_time
+        return last_backup_period != current_period
 
-    def remove_oldest_file(self, interval: Interval, files_in_folder):
+    def remove_oldest_files(
+        self,
+        interval: Interval,
+        files: List[str],
+    ):
+        # Never delete backups before a successful upload.
+        # Only remove files exceeding the retention limit.
+        files = sorted(files)
 
-        # when folder is empty, skip removing the oldest file
-        if len(files_in_folder) == 0:
-            return
+        while len(files) > interval.max_backups:
+            oldest_file = files[0]
 
-        # when the file count hasn't reached the limit, skip removing the oldest file
-        if len(files_in_folder) <= interval.max_backups:
-            return
+            self.print_info(
+                f'Deleting old {interval.name} backup: {oldest_file}'
+            )
 
-        oldest_file_name = files_in_folder[0]
-        oldest_file_path = os.path.join(self.env, interval.name, oldest_file_name)
-        try:
-            self.storage.delete_file(oldest_file_path)
-            self.print_info(f'Deleted Old Backup For {interval.name} Named {oldest_file_name}')
-        except (Exception,):
-            self.print_error(f'Error Deleting File {oldest_file_name}')
+            self.storage.delete_file(oldest_file)
+            files.pop(0)
 
     def job(self):
-        for interval in INTERVALS:
-            try:
-                path = os.path.join(self.env, interval.name)
-                files: list = self.storage.list_directory(directory_path=path)
-                files.sort()
-            except (Exception,):
-                self.print_error('Error Getting Files')
-                files = []
+        DUMPED_FILES_FOLDER.mkdir(parents=True, exist_ok=True)
 
-            if self.should_save_new_file(interval, files):
-                file_name = f'{time.strftime(TIME_FORMAT)}.psql'
-                file_path = os.path.join(self.env, interval.name, file_name)
-                self.print_info(f'Creating Backup For {interval.name} Named {file_name}')
-                creation_successful = self.create_backup(file_path)
+        # Start each execution with a fresh dump.
+        self.remove_dumped_file()
 
-                if creation_successful:
-                    files.append(file_name)
-                    self.remove_oldest_file(interval, files)
+        try:
+            for interval in INTERVALS:
+                directory = f'{self.env}/{interval.name}'
 
-        self.print_info('Backup Script Complete')
+                files = self.storage.list_directory(directory)
+
+                if not self.should_save_new_file(interval, files):
+                    self.print_info(
+                        f'Backup already exists for {interval.name}'
+                    )
+                    continue
+
+                filename = f'{time.strftime(TIME_FORMAT)}.psql'
+                object_key = f'{directory}/{filename}'
+
+                self.create_backup(object_key)
+
+                files.append(object_key)
+
+                self.remove_oldest_files(interval, files)
+
+            self.print_info('Backup Script Complete')
+
+        finally:
+            self.remove_dumped_file()
 
     def run(self):
-        self.print_info('Running backup Script')
+        self.print_info('Running Backup Script')
         self.job()
 
 
 if __name__ == '__main__':
-    c = Command()
-    c.run()
+    try:
+        command = Command()
+        command.run()
+    except Exception as e:
+        print(
+            f'Backup job failed: {e}',
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.exit(1)
